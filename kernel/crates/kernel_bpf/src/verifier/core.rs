@@ -1088,4 +1088,29 @@ mod tests {
         let result = Verifier::<ActiveProfile>::verify(BpfProgType::SocketFilter, &insns);
         assert!(result.is_ok(), "got {:?}", result.err());
     }
+
+    /// ALU32 arithmetic-shift soundness (codex re-review on #114).
+    ///
+    /// `w0 = 0x80000000; w0 s>>= 31; w0 += 1; w1 = 10; w1 /= w0`. On the
+    /// AArch64 JIT the signed-32 arsh gives `0xFFFFFFFF`, so `+1` wraps to `0`
+    /// and the final divide is by zero. Because ALU32 arsh is widened (the
+    /// interpreter and JIT disagree), `w0` stays unknown and the verifier
+    /// rejects the divide rather than trusting a wrong constant.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn alu32_arsh_then_div_is_caught_as_division_by_zero() {
+        let insns = [
+            BpfInsn::new(0xb4, 0, 0, 0, i32::MIN), // w0 = 0x80000000 (mov32 imm)
+            BpfInsn::new(0xc4, 0, 0, 0, 31),       // w0 s>>= 31      (arsh32 imm)
+            BpfInsn::new(0x04, 0, 0, 0, 1),        // w0 += 1         (add32 imm)
+            BpfInsn::new(0xb4, 1, 0, 0, 10),       // w1 = 10         (mov32 imm)
+            BpfInsn::new(0x3c, 1, 0, 0, 0),        // w1 /= w0        (div32 reg)
+            BpfInsn::exit(),
+        ];
+        let result = Verifier::<ActiveProfile>::verify(BpfProgType::SocketFilter, &insns);
+        assert!(
+            matches!(result, Err(VerifyError::DivisionByZero { .. })),
+            "got {result:?}"
+        );
+    }
 }

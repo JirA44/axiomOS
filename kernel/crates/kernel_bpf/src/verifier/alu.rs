@@ -80,7 +80,24 @@ pub fn compute_alu_result_width(
         AluOp::Xor => bitwise_xor(dst, rhs),
         AluOp::Lsh => lshift(dst, rhs),
         AluOp::Rsh => rshift(dst, rhs),
-        AluOp::Arsh => arshift(dst, rhs),
+        AluOp::Arsh => {
+            if is_64bit {
+                arshift(dst, rhs)
+            } else {
+                // ALU32 ARSH: the sign comes from bit 31, but `arshift` shifts
+                // a (zero-extended) 64-bit value whose bit 63 is 0, so it fills
+                // zeros instead of replicating bit 31. Worse, the two executors
+                // disagree: the interpreter logical-shifts the zero-extended
+                // value (fills 0), while the AArch64 JIT (`emit_asr32_reg`)
+                // does a true signed-32 shift (fills 1) — so for an input with
+                // bit 31 set, `w0 s>>= 31` is `0x0000_0001` on the interpreter
+                // and `0xFFFF_FFFF` on the JIT. No single value is sound for
+                // both, so conservatively widen the low 32 bits to unknown
+                // (high 32 known zero). Precise modeling needs the interpreter
+                // and JIT to agree on ALU32 ARSH first (separate issue).
+                zero_extend_32(ScalarValue::unknown())
+            }
+        }
         AluOp::Neg => negate(dst),
         AluOp::End => ScalarValue::unknown(),
     };
@@ -680,5 +697,19 @@ mod tests {
         let dst = ScalarValue::constant(0x1_0000_0000);
         let r = compute_alu_result_width(dst, AluOp::Rsh, ScalarValue::constant(1), false);
         assert_eq!(r.value, Some(0));
+    }
+
+    #[test]
+    fn alu32_arsh_widens_due_to_executor_divergence() {
+        // `w0 = 0x8000_0000; w0 s>>= 31`: interpreter yields 1, AArch64 JIT
+        // yields 0xFFFF_FFFF. No single value is sound for both executors, so
+        // the verifier widens the low 32 bits rather than committing to one.
+        let dst = ScalarValue::constant(0x8000_0000);
+        let r = compute_alu_result_width(dst, AluOp::Arsh, ScalarValue::constant(31), false);
+        assert!(r.value.is_none(), "must not commit to a constant");
+        assert_eq!(r.max, 0xFFFF_FFFF);
+        // High 32 bits stay known-zero.
+        assert_eq!(r.tnum.mask & 0xFFFF_FFFF_0000_0000, 0);
+        assert_eq!(r.tnum.value & 0xFFFF_FFFF_0000_0000, 0);
     }
 }
