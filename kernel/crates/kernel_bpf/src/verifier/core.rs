@@ -9,7 +9,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
-use super::alu::{compute_alu_result, scalar_from_imm};
+use super::alu::{compute_alu_result_width, scalar_from_imm};
 use super::cfg::ControlFlowGraph;
 use super::error::{VerifyError, VerifyResult};
 use super::helpers::{HelperValidation, validate_helper_call};
@@ -438,7 +438,10 @@ impl<P: PhysicalProfile> Verifier<P> {
             .scalar_value
             .unwrap_or_else(ScalarValue::unknown);
 
-        let result = compute_alu_result(dst_scalar, alu_op, rhs);
+        // Thread the ALU width: 32-bit ops zero-extend their result into the
+        // 64-bit register, which `compute_alu_result_width` models. Modeling a
+        // 32-bit op as 64-bit is unsound (see the function's docs).
+        let result = compute_alu_result_width(dst_scalar, alu_op, rhs, insn.is_alu64());
         state.set_scalar(dst, Some(result));
 
         Ok(())
@@ -515,9 +518,18 @@ impl<P: PhysicalProfile> Verifier<P> {
 
         // Compute branch refinement when both dst and rhs are scalar.
         // Pointer-arithmetic refinement is its own future-issue.
+        //
+        // Width gate: a 32-bit jump (`BPF_JMP32`) compares only the low 32
+        // bits of its operands (the interpreter truncates dst/src to u32
+        // before comparing). Refining the full 64-bit `ScalarValue` against a
+        // 32-bit comparison would be unsound — e.g. `if w0 < 100` tells us
+        // nothing about bits 32..63 of r0. Until 32-bit-aware refinement
+        // lands, only refine on 64-bit jumps (`BPF_JMP`); skipping refinement
+        // is always sound, just less precise.
+        let is_jmp64 = matches!(insn.class(), Some(crate::bytecode::opcode::OpcodeClass::Jmp));
         let dst_scalar = state.reg(dst).scalar_value;
         let refinement = match (dst_scalar, rhs) {
-            (Some(dst_sv), Some(rhs_sv)) => {
+            (Some(dst_sv), Some(rhs_sv)) if is_jmp64 => {
                 let refined = refine_scalar(dst_sv, jmp_op, rhs_sv);
                 Some(BranchRefinement {
                     dst,
@@ -984,6 +996,46 @@ mod tests {
         let insns = [
             BpfInsn::mov64_imm(0, 5),
             BpfInsn::add64_imm(0, 3),
+            BpfInsn::exit(),
+        ];
+
+        let result = Verifier::<ActiveProfile>::verify(BpfProgType::SocketFilter, &insns);
+        assert!(result.is_ok(), "got {:?}", result.err());
+    }
+
+    /// Acceptance for the ALU32 width fix.
+    ///
+    /// `w0 = 0xFFFFFFFF; w0 += 1` zero-extends to `0` (the interpreter
+    /// truncates 32-bit ALU results), so a subsequent 32-bit divide *by* w0
+    /// is a real division by zero. The previous width-blind verifier tracked
+    /// r0 as `0x1_0000_0000` (nonzero) and proved the divide safe — unsound.
+    /// The verifier must now reject it, matching runtime.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn alu32_wrap_is_division_by_zero() {
+        let insns = [
+            BpfInsn::new(0xb4, 0, 0, 0, -1), // w0 = 0xFFFFFFFF  (mov32 imm)
+            BpfInsn::new(0x04, 0, 0, 0, 1),  // w0 += 1          (add32 imm) → wraps to 0
+            BpfInsn::mov64_imm(1, 10),       // r1 = 10
+            BpfInsn::new(0x3c, 1, 0, 0, 0),  // w1 /= w0         (div32 reg) → div by zero
+            BpfInsn::exit(),
+        ];
+
+        let result = Verifier::<ActiveProfile>::verify(BpfProgType::SocketFilter, &insns);
+        assert!(
+            matches!(result, Err(VerifyError::DivisionByZero { .. })),
+            "32-bit wrap to zero should be caught as division by zero; got {result:?}"
+        );
+    }
+
+    /// Companion: a 32-bit program that does *not* wrap to a dangerous value
+    /// still verifies. `w0 = 5; w0 += 3` → 8.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn alu32_safe_program_verifies() {
+        let insns = [
+            BpfInsn::new(0xb4, 0, 0, 0, 5), // w0 = 5   (mov32 imm)
+            BpfInsn::new(0x04, 0, 0, 0, 3), // w0 += 3  (add32 imm)
             BpfInsn::exit(),
         ];
 

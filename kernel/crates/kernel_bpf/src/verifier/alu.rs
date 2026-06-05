@@ -23,14 +23,38 @@
 use super::state::{ScalarValue, TnumValue};
 use crate::bytecode::opcode::AluOp;
 
-/// Compute the new ScalarValue after `dst = op(dst, rhs)`.
+/// Compute the new ScalarValue after a **64-bit** `dst = op(dst, rhs)`.
 ///
 /// Falls back to `ScalarValue::unknown()` for operations the lattice can't
 /// represent precisely (e.g. integer division by a range, byte swap).
 /// Conservative: any imprecision widens to fully unknown so the existing
 /// memory-bounds / safety checks downstream see the widest reachable value.
+///
+/// This is the width-agnostic entry point retained for API stability; it is
+/// equivalent to [`compute_alu_result_width`] with `is_64bit = true`.
 pub fn compute_alu_result(dst: ScalarValue, op: AluOp, rhs: ScalarValue) -> ScalarValue {
-    match op {
+    compute_alu_result_width(dst, op, rhs, true)
+}
+
+/// Compute the new ScalarValue after `dst = op(dst, rhs)`, accounting for ALU
+/// width.
+///
+/// BPF 32-bit ALU (`BPF_ALU` / the `w`-register form) computes the operation
+/// then **zero-extends the low 32 bits into the 64-bit register** — exactly
+/// `(result as u32) as u64`, matching the interpreter
+/// (`execution/interpreter.rs`, "Truncate to 32 bits for 32-bit ALU"). The
+/// previous width-blind implementation modeled every op as 64-bit, which is
+/// unsound: e.g. `w0 = 0xFFFFFFFF; w0 += 1` is tracked as the constant
+/// `0x1_0000_0000` (nonzero) while the runtime wraps to `0`, so a subsequent
+/// 32-bit `div`/`mod` by `w0` is proven safe yet divides by zero. Threading
+/// the width here and zero-extending the result closes that gap.
+pub fn compute_alu_result_width(
+    dst: ScalarValue,
+    op: AluOp,
+    rhs: ScalarValue,
+    is_64bit: bool,
+) -> ScalarValue {
+    let res = match op {
         AluOp::Mov => mov(rhs),
         AluOp::Add => add(dst, rhs),
         AluOp::Sub => sub(dst, rhs),
@@ -45,6 +69,60 @@ pub fn compute_alu_result(dst: ScalarValue, op: AluOp, rhs: ScalarValue) -> Scal
         AluOp::Arsh => arshift(dst, rhs),
         AluOp::Neg => negate(dst),
         AluOp::End => ScalarValue::unknown(),
+    };
+
+    if is_64bit {
+        res
+    } else {
+        zero_extend_32(res)
+    }
+}
+
+/// Model the 64-bit register state after a 32-bit ALU result is written:
+/// the upper 32 bits become known-zero and the value is `x & 0xFFFF_FFFF`.
+///
+/// Soundness: the returned scalar contains exactly
+/// `{ v & 0xFFFF_FFFF : v ∈ γ(input) }`. The tnum high half is forced to
+/// known-zero; the interval is kept exact when the input does not straddle a
+/// 2^32 boundary and widened to `[0, u32::MAX]` otherwise; a known constant is
+/// truncated and pins the interval.
+fn zero_extend_32(v: ScalarValue) -> ScalarValue {
+    const MASK: u64 = 0xFFFF_FFFF;
+
+    // High 32 bits become known-zero; low 32 retain whatever the op produced.
+    let tnum = TnumValue {
+        value: v.tnum.value & MASK,
+        mask: v.tnum.mask & MASK,
+    };
+
+    let value = v.value.map(|x| x & MASK);
+
+    // Truncation preserves ordering only inside a single 2^32 block.
+    let (mut min, mut max) = if (v.min >> 32) == (v.max >> 32) {
+        (v.min & MASK, v.max & MASK)
+    } else {
+        (0, MASK)
+    };
+
+    // The masked tnum gives sound bounds too; intersect when consistent.
+    let tnum_min = tnum.value;
+    let tnum_max = tnum.value | tnum.mask;
+    if tnum_min <= tnum_max && tnum_min >= min && tnum_max <= max {
+        min = tnum_min;
+        max = tnum_max;
+    }
+
+    // A known constant pins the interval exactly.
+    if let Some(c) = value {
+        min = c;
+        max = c;
+    }
+
+    ScalarValue {
+        value,
+        min,
+        max,
+        tnum,
     }
 }
 
@@ -486,5 +564,69 @@ mod tests {
         // i32 -1 should become u64::MAX as a sign-extended scalar.
         let r = scalar_from_imm(-1);
         assert_eq!(r.value, Some(u64::MAX));
+    }
+
+    // --- ALU width (32-bit zero-extension) ---
+
+    #[test]
+    fn alu32_add_wraps_to_zero() {
+        // w0 = 0xFFFFFFFF; w0 += 1  →  0 (zero-extended), not 2^32.
+        let start = ScalarValue::constant(0xFFFF_FFFF);
+        let r = compute_alu_result_width(start, AluOp::Add, ScalarValue::constant(1), false);
+        assert_eq!(r.value, Some(0));
+        assert_eq!(r.min, 0);
+        assert_eq!(r.max, 0);
+        assert!(r.could_be_zero());
+    }
+
+    #[test]
+    fn alu64_add_does_not_wrap() {
+        // Same operands, 64-bit: result is 2^32, no truncation.
+        let start = ScalarValue::constant(0xFFFF_FFFF);
+        let r = compute_alu_result_width(start, AluOp::Add, ScalarValue::constant(1), true);
+        assert_eq!(r.value, Some(0x1_0000_0000));
+        assert!(!r.could_be_zero());
+    }
+
+    #[test]
+    fn alu32_mov_truncates_high_bits() {
+        // w0 = r1 where r1 = 0x1_0000_00AA  →  0xAA.
+        let big = ScalarValue::constant(0x1_0000_00AA);
+        let r = compute_alu_result_width(ScalarValue::unknown(), AluOp::Mov, big, false);
+        assert_eq!(r.value, Some(0xAA));
+        assert_eq!(r.tnum.mask, 0); // known constant
+    }
+
+    #[test]
+    fn alu32_result_high_bits_known_zero() {
+        // 32-bit AND of unknown with 0xff: low byte unknown, every high bit
+        // (including bits 32..63) known zero.
+        let r = compute_alu_result_width(
+            ScalarValue::unknown(),
+            AluOp::And,
+            ScalarValue::constant(0xff),
+            false,
+        );
+        assert_eq!(r.tnum.mask & 0xFFFF_FFFF_0000_0000, 0);
+        assert_eq!(r.max, 0xff);
+        // Soundness: result contains every truncated concrete value 0..=255.
+        for k in 0..=255u64 {
+            assert!(r.tnum.contains(k), "missing {k}");
+        }
+    }
+
+    #[test]
+    fn alu32_straddling_interval_widens_soundly() {
+        // Input interval crosses a 2^32 boundary → truncated interval must
+        // widen to the full 32-bit range (no false tight bound).
+        let v = ScalarValue {
+            value: None,
+            min: 0xFFFF_FFF0,
+            max: 0x1_0000_0010,
+            tnum: TnumValue::unknown(),
+        };
+        let r = compute_alu_result_width(v, AluOp::Mov, v, false);
+        assert_eq!(r.min, 0);
+        assert_eq!(r.max, 0xFFFF_FFFF);
     }
 }
