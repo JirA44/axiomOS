@@ -46,7 +46,7 @@ mod refine;
 mod state;
 mod streaming;
 
-pub use core::Verifier;
+pub use core::{Verifier, VerifyConfig};
 
 pub use alu::{compute_alu_result, scalar_from_imm};
 pub use cfg::ControlFlowGraph;
