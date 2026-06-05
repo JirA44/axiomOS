@@ -100,7 +100,11 @@ pub fn compute_alu_result_width(
 /// known-zero; the interval is kept exact when the input does not straddle a
 /// 2^32 boundary and widened to `[0, u32::MAX]` otherwise; a known constant is
 /// truncated and pins the interval.
-fn zero_extend_32(v: ScalarValue) -> ScalarValue {
+///
+/// `pub(crate)` so `verify_alu`'s 32-bit division-by-zero guard can truncate
+/// the divisor before its `could_be_zero()` check (an all-zero low 32 bits
+/// under a nonzero high half is still a zero divisor for ALU32).
+pub(crate) fn zero_extend_32(v: ScalarValue) -> ScalarValue {
     const MASK: u64 = 0xFFFF_FFFF;
 
     // High 32 bits become known-zero; low 32 retain whatever the op produced.

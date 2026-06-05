@@ -390,11 +390,20 @@ impl<P: PhysicalProfile> Verifier<P> {
                 });
             }
 
-            // Check for division by zero
+            // Check for division by zero. For a 32-bit div/mod the divisor is
+            // truncated to its low 32 bits before the operation, so the zero
+            // check must look at the low 32 bits too: a divisor like `2^32` has
+            // all-zero low bits and would otherwise slip past `could_be_zero()`
+            // on its full 64-bit value (e.g. `r1 = 1; r1 <<= 32; w0 /= w1`).
             if alu_op.can_divide_by_zero() {
                 let src_state = state.reg(src);
                 if let Some(ref scalar) = src_state.scalar_value {
-                    if scalar.could_be_zero() {
+                    let divisor = if insn.is_alu64() {
+                        *scalar
+                    } else {
+                        super::alu::zero_extend_32(*scalar)
+                    };
+                    if divisor.could_be_zero() {
                         return Err(VerifyError::DivisionByZero { insn_idx: idx });
                     }
                 } else if src_state.reg_type == RegType::Scalar {
@@ -1039,6 +1048,43 @@ mod tests {
             BpfInsn::exit(),
         ];
 
+        let result = Verifier::<ActiveProfile>::verify(BpfProgType::SocketFilter, &insns);
+        assert!(result.is_ok(), "got {:?}", result.err());
+    }
+
+    /// ALU32 divisor zero-check must look at the low 32 bits (codex re-review
+    /// on #114). `r1 = 1; r1 <<= 32` makes r1 = 2^32, whose low 32 bits are
+    /// zero, so a 32-bit divide by it is a division by zero even though the
+    /// full 64-bit value is nonzero.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn alu32_divisor_with_zero_low_bits_is_division_by_zero() {
+        let insns = [
+            BpfInsn::mov64_imm(1, 1),       // r1 = 1
+            BpfInsn::lsh64_imm(1, 32),      // r1 <<= 32  → 0x1_0000_0000
+            BpfInsn::mov64_imm(0, 10),      // r0 = 10
+            BpfInsn::new(0x3c, 0, 1, 0, 0), // w0 /= w1   (div32 reg) → low32(w1) = 0
+            BpfInsn::exit(),
+        ];
+        let result = Verifier::<ActiveProfile>::verify(BpfProgType::SocketFilter, &insns);
+        assert!(
+            matches!(result, Err(VerifyError::DivisionByZero { .. })),
+            "32-bit divide by a value with zero low bits should be division by zero; got {result:?}"
+        );
+    }
+
+    /// Width-sensitivity companion: the *64-bit* divide by the same 2^32 is a
+    /// nonzero divisor and must still verify.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn alu64_divide_by_two_pow_32_is_ok() {
+        let insns = [
+            BpfInsn::mov64_imm(1, 1),
+            BpfInsn::lsh64_imm(1, 32),      // r1 = 2^32
+            BpfInsn::mov64_imm(0, 10),
+            BpfInsn::new(0x3f, 0, 1, 0, 0), // r0 /= r1  (div64 reg), divisor nonzero
+            BpfInsn::exit(),
+        ];
         let result = Verifier::<ActiveProfile>::verify(BpfProgType::SocketFilter, &insns);
         assert!(result.is_ok(), "got {:?}", result.err());
     }
