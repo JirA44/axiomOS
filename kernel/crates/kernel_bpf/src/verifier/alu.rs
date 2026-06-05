@@ -54,6 +54,20 @@ pub fn compute_alu_result_width(
     rhs: ScalarValue,
     is_64bit: bool,
 ) -> ScalarValue {
+    // For 32-bit ALU, truncate **both operands** to their low 32 bits *before*
+    // the operation, then zero-extend the result. Truncating only the result
+    // is unsound for the non-modular operations: division, modulo, and the
+    // right shifts depend on the high operand bits, so e.g. ALU32 `(2^32) / 2`
+    // must be `0 / 2 == 0`, not `2^31`. For add/sub/mul/and/or/xor/lsh the low
+    // 32 result bits depend only on the low 32 operand bits, so pre-truncating
+    // is a harmless normalization there. This matches the interpreter, which
+    // operates on registers already zero-extended by prior 32-bit ops.
+    let (dst, rhs) = if is_64bit {
+        (dst, rhs)
+    } else {
+        (zero_extend_32(dst), zero_extend_32(rhs))
+    };
+
     let res = match op {
         AluOp::Mov => mov(rhs),
         AluOp::Add => add(dst, rhs),
@@ -628,5 +642,39 @@ mod tests {
         let r = compute_alu_result_width(v, AluOp::Mov, v, false);
         assert_eq!(r.min, 0);
         assert_eq!(r.max, 0xFFFF_FFFF);
+    }
+
+    // ALU32 div/mod/rsh must truncate operands *before* the op, not just the
+    // result (codex review on #114). These are the non-modular cases where a
+    // high operand bit changes the low result bits.
+
+    #[test]
+    fn alu32_div_truncates_operands_not_just_result() {
+        // dst = 2^32 (a bit above the 32-bit window), ALU32 `/2`.
+        // Correct: (dst as u32) = 0, so 0 / 2 == 0. The result-only-truncation
+        // bug computed 2^32 / 2 = 2^31 and zero-extended to 0x8000_0000, which
+        // would wrongly look nonzero to the div-by-zero check.
+        let dst = ScalarValue::constant(0x1_0000_0000);
+        let r = compute_alu_result_width(dst, AluOp::Div, ScalarValue::constant(2), false);
+        assert_eq!(r.value, Some(0));
+        assert!(r.could_be_zero());
+    }
+
+    #[test]
+    fn alu32_mod_truncates_operands() {
+        // dst = 2^32 + 1, ALU32 `% 4`  →  (1) % 4 == 1, not (2^32 + 1) % 4.
+        let dst = ScalarValue::constant(0x1_0000_0001);
+        let r = compute_alu_result_width(dst, AluOp::Mod, ScalarValue::constant(4), false);
+        assert_eq!(r.value, Some(1));
+    }
+
+    #[test]
+    fn alu32_rsh_truncates_operands() {
+        // dst = 2^32, ALU32 `>> 1`  →  (0) >> 1 == 0, not 2^31. Right shift
+        // pulls high operand bits down into the low 32, so operand truncation
+        // matters here too.
+        let dst = ScalarValue::constant(0x1_0000_0000);
+        let r = compute_alu_result_width(dst, AluOp::Rsh, ScalarValue::constant(1), false);
+        assert_eq!(r.value, Some(0));
     }
 }
