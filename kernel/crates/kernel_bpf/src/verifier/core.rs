@@ -1014,13 +1014,14 @@ fn apply_null_refine(state: &mut VerifierState, nr: PtrNullRefine, is_true_arm: 
 /// Bounds-check a dereference through a non-stack pointer that carries a
 /// tracked region size (map value, ctx, packet).
 ///
-/// Rejects, in order: a **maybe-null** pointer (needs a null check first), a
+/// Rejects, in order: a **maybe-null** pointer (needs a null check first); a
 /// pointer whose region size is **unknown** (`mem_range == None` — never blind-
-/// dereference), and an access whose `[ptr_offset + insn_offset,
-/// + access_size)` window falls **outside** `[0, mem_range)`. This is what the
-/// old verifier was missing — `verify_memory` only bounds-checked the stack,
-/// so map-value/ctx/packet dereferences went entirely unchecked and the
-/// interpreter then trusted any non-null pointer.
+/// dereference); and an access whose window
+/// `[ptr_offset + insn_off, ptr_offset + insn_off + access_size)` falls
+/// **outside** `[0, mem_range)`. This is what the old verifier was missing:
+/// `verify_memory` only bounds-checked the stack, so map-value/ctx/packet
+/// dereferences went entirely unchecked and the interpreter then trusted any
+/// non-null pointer.
 fn check_ranged_deref(
     rs: &RegState,
     insn_off: i64,
