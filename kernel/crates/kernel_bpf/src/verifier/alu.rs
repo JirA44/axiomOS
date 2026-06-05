@@ -102,11 +102,7 @@ pub fn compute_alu_result_width(
         AluOp::End => ScalarValue::unknown(),
     };
 
-    if is_64bit {
-        res
-    } else {
-        zero_extend_32(res)
-    }
+    if is_64bit { res } else { zero_extend_32(res) }
 }
 
 /// Model the 64-bit register state after a 32-bit ALU result is written:

@@ -535,7 +535,10 @@ impl<P: PhysicalProfile> Verifier<P> {
         // nothing about bits 32..63 of r0. Until 32-bit-aware refinement
         // lands, only refine on 64-bit jumps (`BPF_JMP`); skipping refinement
         // is always sound, just less precise.
-        let is_jmp64 = matches!(insn.class(), Some(crate::bytecode::opcode::OpcodeClass::Jmp));
+        let is_jmp64 = matches!(
+            insn.class(),
+            Some(crate::bytecode::opcode::OpcodeClass::Jmp)
+        );
         let dst_scalar = state.reg(dst).scalar_value;
         let refinement = match (dst_scalar, rhs) {
             (Some(dst_sv), Some(rhs_sv)) if is_jmp64 => {
@@ -1080,7 +1083,7 @@ mod tests {
     fn alu64_divide_by_two_pow_32_is_ok() {
         let insns = [
             BpfInsn::mov64_imm(1, 1),
-            BpfInsn::lsh64_imm(1, 32),      // r1 = 2^32
+            BpfInsn::lsh64_imm(1, 32), // r1 = 2^32
             BpfInsn::mov64_imm(0, 10),
             BpfInsn::new(0x3f, 0, 1, 0, 0), // r0 /= r1  (div64 reg), divisor nonzero
             BpfInsn::exit(),
