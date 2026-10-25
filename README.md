@@ -1,3 +1,13 @@
+## Français
+
+Noyau bare-metal Rust expérimental pour robots et systèmes embarqués, avec logique évolutive via programmes eBPF vérifiés. Exemple : explorer le prototype et ses hooks d’exécution ; le projet est en développement et n’est pas prêt pour un déploiement critique.
+
+## English
+
+An experimental bare-metal Rust kernel for robotics and embedded systems, with runtime evolution through verified eBPF programs. Example: explore the prototype and runtime hooks; it is a work in progress, not ready for critical deployment.
+
+---
+
 # Axiom
 
 A bare-metal Rust kernel with runtime-programmable behavior through verified eBPF programs.
